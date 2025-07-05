@@ -10,9 +10,13 @@ const { Product, Order, AdminUser } = require('./models');
 const config = require('./config');
 
 // --- Configuração do Cloudinary ---
+// É preciso configurar o Cloudinary com as credenciais do nosso config.js
 cloudinary.config(config.cloudinary);
 
 // --- Agente HTTPS para a API M-Pesa Sandbox ---
+// A API de sandbox do M-Pesa usa um certificado autoassinado, o que causa erros em Node.js.
+// Esta configuração ignora a verificação do certificado APENAS para as requisições ao M-Pesa.
+// ATENÇÃO: Não use rejectUnauthorized: false em produção com APIs que tenham certificados válidos.
 const mpesaAgent = new https.Agent({
   rejectUnauthorized: false,
 });
@@ -21,7 +25,7 @@ const mpesaAgent = new https.Agent({
 // == CONTROLLERS DE AUTENTICAÇÃO E ADMIN ==========================
 // =================================================================
 
-// (Nenhuma mudança nesta seção)
+// Criar um novo administrador (deve ser protegido ou usado apenas para setup inicial)
 exports.registerAdmin = async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -44,6 +48,7 @@ exports.registerAdmin = async (req, res) => {
   }
 };
 
+// Login do administrador
 exports.loginAdmin = async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -70,7 +75,7 @@ exports.loginAdmin = async (req, res) => {
 // == CONTROLLERS DE PRODUTOS (Público e Admin) =====================
 // =================================================================
 
-// (Nenhuma mudança nesta seção)
+// Criar um novo produto (Admin)
 exports.createProduct = async (req, res) => {
   try {
     const { name, descriptionShort, descriptionFull, price, stock, olfactoryNotes, size, type, featured } = req.body;
@@ -82,6 +87,7 @@ exports.createProduct = async (req, res) => {
     
     const imageUploads = [];
     for (const image of images) {
+      // O 'path' vem do middleware 'multer' que processa o upload
       const result = await cloudinary.uploader.upload(image.path, { folder: 'perfumes' });
       imageUploads.push({
         public_id: result.public_id,
@@ -108,6 +114,7 @@ exports.createProduct = async (req, res) => {
   }
 };
 
+// Obter todos os produtos (Público)
 exports.getAllProducts = async (req, res) => {
   try {
     const products = await Product.find().sort({ createdAt: -1 });
@@ -117,6 +124,7 @@ exports.getAllProducts = async (req, res) => {
   }
 };
 
+// Obter um único produto por ID (Público)
 exports.getProductById = async (req, res) => {
     try {
         const product = await Product.findById(req.params.id);
@@ -129,8 +137,10 @@ exports.getProductById = async (req, res) => {
     }
 };
 
+// Atualizar um produto (Admin)
 exports.updateProduct = async (req, res) => {
   try {
+    // Lógica para atualizar texto e, opcionalmente, imagens (mais complexa)
     const updatedProduct = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!updatedProduct) {
         return res.status(404).json({ message: 'Produto não encontrado para atualizar.' });
@@ -141,15 +151,19 @@ exports.updateProduct = async (req, res) => {
   }
 };
 
+// Deletar um produto (Admin)
 exports.deleteProduct = async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
     if (!product) {
       return res.status(404).json({ message: 'Produto não encontrado.' });
     }
+
+    // Deletar imagens do Cloudinary antes de deletar o produto do DB
     for (const image of product.images) {
       await cloudinary.uploader.destroy(image.public_id);
     }
+
     await Product.findByIdAndDelete(req.params.id);
     res.status(200).json({ message: 'Produto deletado com sucesso.' });
   } catch (error) {
@@ -161,7 +175,7 @@ exports.deleteProduct = async (req, res) => {
 // == CONTROLLERS DE PEDIDOS E PAGAMENTO ===========================
 // =================================================================
 
-// [NOVO] Função utilitária para normalizar o número de telefone para o padrão M-Pesa
+// Função utilitária para normalizar o número de telefone para o padrão M-Pesa
 const normalizeMpesaNumber = (phone) => {
   let cleanPhone = phone.replace(/\D/g, ''); // Remove todos os não-dígitos
   if (cleanPhone.startsWith('0')) {
@@ -177,14 +191,15 @@ const normalizeMpesaNumber = (phone) => {
   throw new Error(`Número de telefone '${phone}' é inválido para M-Pesa.`);
 };
 
-
 // Função utilitária para enviar notificações via WhatsApp
+// O 'sock' (cliente Baileys) será passado do server.js
 const sendWhatsAppMessage = async (sock, to, message) => {
     try {
         if (!sock) {
             console.log("Cliente WhatsApp (sock) não inicializado. Mensagem não enviada.");
             return;
         }
+        // Formata o número para o padrão do Baileys (ex: 258841234567@s.whatsapp.net)
         const formattedNumber = `${to.replace(/\D/g, '')}@s.whatsapp.net`;
         await sock.sendMessage(formattedNumber, { text: message });
         console.log(`Mensagem enviada para ${formattedNumber}`);
@@ -193,7 +208,9 @@ const sendWhatsAppMessage = async (sock, to, message) => {
     }
 };
 
-
+// Criar um novo pedido (Checkout)
+// Esta função é um "higher-order function". Ela recebe 'sock' e retorna o controller.
+// Isso nos permite injetar a dependência do cliente WhatsApp.
 exports.createOrder = (sock) => async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -204,7 +221,7 @@ exports.createOrder = (sock) => async (req, res) => {
         if (!customerInfo || !products || !paymentMethod) {
             return res.status(400).json({ message: "Dados do pedido incompletos." });
         }
-
+        
         let totalAmount = 0;
         const productDetails = [];
 
@@ -217,15 +234,15 @@ exports.createOrder = (sock) => async (req, res) => {
                 throw new Error(`Estoque insuficiente para o produto: ${product.name}.`);
             }
             
-            // O preço é buscado do backend, não do frontend, por segurança.
             totalAmount += product.price * item.quantity;
             productDetails.push({ product: product._id, quantity: item.quantity, price: product.price });
 
+            // Decrementa o estoque
             product.stock -= item.quantity;
             await product.save({ session });
         }
         
-        // Gera uma referência única para o pedido
+        // Gera uma referência única para o pedido (Third Party Reference)
         const thirdPartyReference = `PERFUME_${Date.now()}`;
         
         const order = new Order({
@@ -242,7 +259,6 @@ exports.createOrder = (sock) => async (req, res) => {
 
         // --- LÓGICA DE PAGAMENTO ---
         if (paymentMethod === 'Mpesa') {
-            // [MELHORADO] Normaliza o número de telefone antes de enviar para a API
             const mpesaPhoneNumber = normalizeMpesaNumber(customerInfo.phone);
 
             const mpesaPayload = {
@@ -256,10 +272,15 @@ exports.createOrder = (sock) => async (req, res) => {
             console.log("Enviando para M-Pesa:", mpesaPayload); // Log útil para debug
 
             const mpesaResponse = await axios.post(config.mpesa.apiURL, mpesaPayload, {
-                headers: { 'Authorization': config.mpesa.authToken, 'Content-Type': 'application/json' },
+                headers: { 
+                    'Authorization': config.mpesa.authToken, 
+                    'Content-Type': 'application/json',
+                    'Origin': '*' // Adicionado para corrigir o erro "Origin header is missing"
+                },
                 httpsAgent: mpesaAgent,
             });
 
+            // Atualiza o pedido com a resposta inicial do M-Pesa
             order.mpesaDetails.conversationID = mpesaResponse.data.output_ConversationID;
             order.mpesaDetails.responseCode = mpesaResponse.data.output_ResponseCode;
             order.mpesaDetails.responseDescription = mpesaResponse.data.output_ResponseDesc;
@@ -268,12 +289,14 @@ exports.createOrder = (sock) => async (req, res) => {
             console.log("Pagamento M-Pesa iniciado. Resposta da API:", mpesaResponse.data);
 
         } else {
-            order.paymentStatus = paymentMethod === 'Entrega' ? 'pending' : 'paid';
+            // Lógica para outros métodos (simulados)
+            order.paymentStatus = paymentMethod === 'Entrega' ? 'pending' : 'paid'; // Ex: "Entrega" fica pendente
             await order.save({ session });
         }
 
         await session.commitTransaction();
         
+        // Envia notificação de pedido criado
         const message = `Olá ${customerInfo.name}, seu pedido #${order.trackingId} foi criado com sucesso! Total: ${totalAmount.toFixed(2)} MZN. Aguardando pagamento.`;
         await sendWhatsAppMessage(sock, customerInfo.phone, message);
 
@@ -287,14 +310,14 @@ exports.createOrder = (sock) => async (req, res) => {
     } catch (error) {
         await session.abortTransaction();
         
-        // [MELHORADO] Log de erro detalhado
+        // Log de erro aprimorado para debugging
         console.error("====== ERRO AO CRIAR PEDIDO ======");
         // Se o erro for do Axios (comunicação com M-Pesa), o erro real estará em `error.response.data`
         if (error.response) {
             console.error("Status do Erro:", error.response.status);
             console.error("Resposta da API externa (M-Pesa):", error.response.data);
             // Retorna uma mensagem de erro mais específica para o frontend
-            const apiErrorMessage = error.response.data?.output_ResponseDesc || 'Erro de comunicação com o serviço de pagamento.';
+            const apiErrorMessage = error.response.data?.output_ResponseDesc || error.response.data?.output_error || 'Erro de comunicação com o serviço de pagamento.';
             return res.status(500).json({ message: `Falha na transação M-Pesa: ${apiErrorMessage}`, error: error.response.data });
         }
         
@@ -308,7 +331,8 @@ exports.createOrder = (sock) => async (req, res) => {
     }
 };
 
-// (Nenhuma mudança no resto do arquivo)
+// Callback do M-Pesa para confirmar o pagamento
+// Esta rota não será chamada pelo nosso frontend, mas sim pelo servidor do M-Pesa.
 exports.mpesaCallback = (sock) => async (req, res) => {
     try {
         console.log('Callback M-Pesa recebido:', req.body);
@@ -325,7 +349,7 @@ exports.mpesaCallback = (sock) => async (req, res) => {
         const order = await Order.findOne({ 'mpesaDetails.thirdPartyReference': thirdPartyReference });
         if (!order) {
             console.error(`Pedido com referência ${thirdPartyReference} não encontrado.`);
-            return res.status(404).send();
+            return res.status(404).send(); // Apenas responde, não envia JSON
         }
 
         order.mpesaDetails.responseCode = resultCode;
@@ -341,6 +365,7 @@ exports.mpesaCallback = (sock) => async (req, res) => {
             order.orderStatus = 'cancelled';
             message = `O pagamento do seu pedido #${order.trackingId} falhou. Motivo: ${resultDesc}. Por favor, tente novamente ou contacte o suporte.`;
             
+            // Reverte o estoque se o pagamento falhar
             for (const item of order.products) {
                 await Product.updateOne({ _id: item.product }, { $inc: { stock: item.quantity } });
             }
@@ -348,15 +373,19 @@ exports.mpesaCallback = (sock) => async (req, res) => {
         
         await order.save();
         
+        // Envia notificação de status de pagamento
         await sendWhatsAppMessage(sock, order.customerInfo.phone, message);
+
+        // Responde ao servidor M-Pesa para confirmar o recebimento do callback
         res.status(200).json({ message: 'Callback processado.' });
 
     } catch (error) {
         console.error('Erro no callback do M-Pesa:', error);
-        res.status(500).send();
+        res.status(500).send(); // Apenas responde, não envia JSON
     }
 };
 
+// Obter todos os pedidos (Admin)
 exports.getAllOrders = async (req, res) => {
     try {
         const orders = await Order.find().populate('products.product').sort({ createdAt: -1 });
@@ -366,6 +395,7 @@ exports.getAllOrders = async (req, res) => {
     }
 };
 
+// Atualizar status de um pedido (Admin)
 exports.updateOrderStatus = (sock) => async (req, res) => {
     try {
         const { orderStatus } = req.body;
@@ -378,6 +408,7 @@ exports.updateOrderStatus = (sock) => async (req, res) => {
         order.orderStatus = orderStatus;
         await order.save();
         
+        // Notifica o cliente sobre a mudança de status
         const message = `Atualização do seu pedido #${order.trackingId}: O status foi alterado para "${orderStatus}".`;
         await sendWhatsAppMessage(sock, order.customerInfo.phone, message);
 
