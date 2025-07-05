@@ -14,40 +14,48 @@ const initializeRoutes = require('./routes');
 let sock;
 
 // --- Função principal para iniciar o cliente WhatsApp (Baileys) ---
-async function startBaileys() {
+// A função agora aceita o objeto de estado da conexão para poder atualizá-lo
+async function startBaileys(connectionState) {
   // Salva a autenticação em arquivos para não precisar escanear o QR code toda vez
   const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_session');
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true, // Imprime o QR code diretamente no terminal
+    printQRInTerminal: true, // Mantém a impressão no terminal para debug
   });
 
-  // Listener para eventos de conexão
+  // Listener para eventos de conexão que atualiza o objeto de estado global
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
+    // Atualiza o objeto de estado que será exposto pela API
     if (qr) {
       console.log('--- PAINEL DE ADMIN: CONEXÃO WHATSAPP ---');
-      console.log('Para conectar o serviço de notificações, escaneie o QR Code abaixo com o seu WhatsApp.');
-      qrcode.generate(qr, { small: true });
-      console.log('\n--- AVISO IMPORTANTE ---');
-      console.log('=> Use um número de WhatsApp DESCARTÁVEL ou um número dedicado para a empresa.');
-      console.log('=> NÃO USE seu número pessoal. O uso de automação pode levar ao banimento do número pelo WhatsApp.');
-      console.log('=> Este número será usado para enviar mensagens automáticas sobre o status dos pedidos para os clientes.');
-      console.log('-------------------------------------------');
+      console.log('Um QR Code foi gerado. Escaneie-o no painel admin ou aqui no terminal.');
+      // Mostra o QR code no terminal como fallback
+      qrcode.generate(qr, { small: true }); 
+      connectionState.qr = qr;
+      connectionState.status = 'qr';
     }
 
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Conexão fechada. Motivo:', lastDisconnect.error, ', reconectando:', shouldReconnect);
+      const statusCode = (lastDisconnect.error)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      
+      console.log(`Conexão fechada. Motivo: ${statusCode}, reconectando: ${shouldReconnect}`);
+      connectionState.status = 'disconnected';
+
       if (shouldReconnect) {
-        startBaileys(); // Tenta reconectar
+        // Tenta reconectar passando o mesmo objeto de estado
+        startBaileys(connectionState); 
       } else {
-        console.error('Não foi possível reconectar. Você foi desconectado. Apague a pasta "baileys_auth_session" e reinicie o servidor para gerar um novo QR Code.');
+        connectionState.status = 'logged_out';
+        console.error('Não foi possível reconectar. Você foi desconectado (logged out). Apague a pasta "baileys_auth_session" e reinicie o servidor para gerar um novo QR Code.');
       }
     } else if (connection === 'open') {
       console.log('Conexão WhatsApp aberta e pronta para enviar mensagens!');
+      connectionState.status = 'connected';
+      connectionState.qr = null; // Limpa o QR code, pois não é mais necessário
     }
   });
 
@@ -71,22 +79,31 @@ async function startServer() {
     .then(() => console.log('Conectado ao MongoDB Atlas com sucesso.'))
     .catch((err) => console.error('Falha ao conectar ao MongoDB:', err));
 
-  // 3. Inicializa o cliente WhatsApp
-  // O servidor só deve começar a aceitar rotas que dependem do WhatsApp depois que o cliente estiver pronto.
+  // 3. Objeto de estado da conexão do WhatsApp e inicialização do Baileys
+  // Este objeto será compartilhado com o Baileys e o novo endpoint de API.
+  let waConnectionState = { status: 'initializing', qr: null };
+  
   console.log('Iniciando cliente WhatsApp...');
-  const waSock = await startBaileys();
+  // Passa o objeto de estado para a função startBaileys
+  const waSock = await startBaileys(waConnectionState);
   
   // 4. Rotas da API
   // Injeta a instância do socket (waSock) no inicializador de rotas
   const apiRoutes = initializeRoutes(waSock);
   app.use('/api', apiRoutes);
   
+  // 5. NOVO ENDPOINT DE STATUS DO WHATSAPP
+  // Este endpoint permite que o frontend consulte o estado atual da conexão.
+  app.get('/api/admin/whatsapp/status', (req, res) => {
+      res.json(waConnectionState);
+  });
+  
   // Rota raiz para health check
   app.get('/', (req, res) => {
     res.send('Servidor da Loja de Perfumes está no ar!');
   });
 
-  // 5. Iniciar o servidor
+  // 6. Iniciar o servidor
   const PORT = config.port;
   app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
