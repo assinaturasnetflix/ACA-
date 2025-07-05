@@ -2,7 +2,7 @@
 
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
-const jwt = 'jsonwebtoken';
+const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const https = require('https'); // Necessário para a API de teste do Mpesa
 const cloudinary = require('cloudinary').v2;
